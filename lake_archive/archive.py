@@ -23,7 +23,8 @@ A correction carries ``seen_restored_mc``: the temperature the page displayed.
 If the archive's current restored value differs, the submission is rejected
 with 409 and nothing is written.  A submission whose restored value is
 unchanged is accepted even when the stored representation has drifted (e.g.
-its base frame was corrected in the meantime).
+Be aware that this protects the single-frame correction page; a supplement
+upload is a separate, batch path described below.
 """
 
 from __future__ import annotations
@@ -54,6 +55,13 @@ class ConflictError(ArchiveError):
         super().__init__(message, status=409)
 
 
+class SupplementError(ArchiveError):
+    """A supplement upload that cannot be accepted; nothing was written."""
+
+    def __init__(self, message: str, status: int = 409):
+        super().__init__(message, status=status)
+
+
 @dataclass(frozen=True)
 class FrameView:
     seq: int
@@ -76,6 +84,12 @@ class ArchiveSummary:
     created_at: str
 
 
+@dataclass(frozen=True)
+class SupplementResult:
+    added: tuple[int, ...]
+    skipped: tuple[int, ...]
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -91,8 +105,23 @@ def init_db(db_path: str) -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         with open(_SCHEMA_PATH, "r", encoding="utf-8") as fh:
             conn.executescript(fh.read())
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a database created by an older release up to this schema.
+
+    Archives imported before ``initial_restored_mc`` existed have no manual
+    corrections on record, so their current restored value is the value they
+    were first archived with.  They remain directly supplantable.
+    """
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(frame)")}
+    if "initial_restored_mc" not in columns:
+        conn.execute("ALTER TABLE frame ADD COLUMN initial_restored_mc INTEGER")
+        conn.execute("UPDATE frame SET initial_restored_mc = restored_mc"
+                     " WHERE initial_restored_mc IS NULL")
 
 
 @contextmanager
@@ -167,10 +196,10 @@ def create_archive(db_path: str, name: str, filename: str, payload: bytes) -> in
             archive_id = cur.lastrowid
             conn.executemany(
                 "INSERT INTO frame (archive_id, seq, sampled_at, sampled_at_raw,"
-                " restored_mc, base_seq, kind_raw, extras_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " restored_mc, initial_restored_mc, base_seq, kind_raw, extras_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [(archive_id, fr.seq, fr.sampled_at, fr.sampled_at_raw,
-                  restored[fr.seq], fr.base_seq, fr.kind_raw,
+                  restored[fr.seq], restored[fr.seq], fr.base_seq, fr.kind_raw,
                   json.dumps(list(fr.extras), ensure_ascii=False)) for fr in rows],
             )
         return archive_id
@@ -344,6 +373,152 @@ def correct_frame(db_path: str, archive_id: int, seq: int, *,
             )
     finally:
         conn.close()
+
+
+def _layout_fingerprint(layout: csvio.CsvLayout) -> tuple:
+    """What "same header and column order" means for a supplement upload."""
+    return (layout.header, layout.delimiter, layout.col_seq, layout.col_time,
+            layout.col_value, layout.col_base, layout.col_kind, layout.extra_cols)
+
+
+def _original_restored(file_frames: dict[int, int],
+                       archive_initial: dict[int, int], base_seq: int) -> int | None:
+    """First-archived restored temperature of ``base_seq``, or None if unknown.
+
+    A base within the uploaded file is decoded from the recorder's own values;
+    a base already in the archive contributes the restored temperature it was
+    first archived with, never a later manual correction.
+    """
+    if base_seq in archive_initial:
+        return archive_initial[base_seq]
+    return file_frames.get(base_seq)
+
+
+def supplement_archive(db_path: str, archive_id: int, filename: str,
+                       payload: bytes) -> SupplementResult:
+    """Merge a recorder's re-transmitted CSV into an existing archive.
+
+    The uploaded file must carry the same header and column order as the
+    archive's original file.  A frame is decoded from the recorder's *original*
+    values: an absolute frame from its own value; a delta frame from its delta
+    plus the first-archived restored temperature of its base -- whether that
+    base is earlier in the same file or already in the archive.  Manual
+    corrections already made in the archive therefore never leak into the
+    decode.
+
+    Frame numbers already in the archive keep their archived state.  Such a
+    frame is skipped when both its sampling instant and its original restored
+    temperature match the archive (so manual corrections survive); any other
+    difference is a conflict, and the whole file is rejected naming the frame
+    numbers, with the archive untouched.
+
+    Only the uploaded file's own frames and the bases they cite are examined.
+    The checks and the insert run in one ``BEGIN IMMEDIATE`` transaction, so
+    two supplements submitted at the same time are applied one after the other
+    under exactly these rules.
+    """
+    rows, layout = csvio.parse_csv(payload, require_bases_in_file=False)
+    if not rows:
+        raise SupplementError("文件不含任何帧。", status=400)
+
+    conn = connect(db_path)
+    try:
+        with _transaction(conn):
+            archive_row = _archive_row(conn, archive_id)
+            stored_layout = csvio.CsvLayout.from_json(archive_row["layout_json"])
+            if _layout_fingerprint(layout) != _layout_fingerprint(stored_layout):
+                raise SupplementError(
+                    "文件表头或列序与原档不一致：原档为 %s，本次为 %s。"
+                    "整份退回，档案保持原样。"
+                    % (_describe_layout(stored_layout), _describe_layout(layout)),
+                    status=400)
+
+            # Only the frames this file carries, and the bases they cite, are
+            # looked at; the rest of the archive is not examined.
+            touched = sorted({fr.seq for fr in rows}
+                             | {fr.base_seq for fr in rows
+                                if fr.base_seq is not None})
+            marks = ",".join("?" * len(touched))
+            archive_initial: dict[int, int] = {}
+            archive_sampled: dict[int, str] = {}
+            for r in conn.execute(
+                    "SELECT seq, sampled_at, initial_restored_mc FROM frame"
+                    " WHERE archive_id = ? AND seq IN (%s)" % marks,
+                    (archive_id, *touched)).fetchall():
+                archive_initial[r["seq"]] = r["initial_restored_mc"]
+                archive_sampled[r["seq"]] = r["sampled_at"]
+
+            # Decode the uploaded frames from the recorder's own values.  An
+            # absolute frame is its value; a delta frame is its delta plus the
+            # base's first-archived restored temperature, with bases earlier in
+            # this file decoded first (rows are ordered by seq).
+            decoded: dict[int, int] = {}
+            no_base: list[tuple[int, int]] = []
+            for fr in rows:
+                if fr.stored_kind == "absolute":
+                    decoded[fr.seq] = fr.stored_mc
+                    continue
+                base_original = _original_restored(
+                    decoded, archive_initial, fr.base_seq)
+                if base_original is None:
+                    no_base.append((fr.seq, fr.base_seq))
+                    continue
+                decoded[fr.seq] = fr.stored_mc + base_original
+            if no_base:
+                raise SupplementError(
+                    "缺少基准帧，整份退回，档案保持原样。相关帧：%s。"
+                    % "；".join("帧 %d（缺基准帧 %d）" % pair for pair in no_base))
+
+            # A frame number already on file must agree with the archive; an
+            # identical one is skipped so any manual correction is kept.
+            conflicts: list[tuple[int, str]] = []
+            skipped: list[int] = []
+            for fr in rows:
+                if fr.seq not in archive_initial:
+                    continue
+                if fr.sampled_at != archive_sampled[fr.seq]:
+                    conflicts.append((fr.seq, "采样时刻不同"))
+                elif decoded[fr.seq] != archive_initial[fr.seq]:
+                    conflicts.append((fr.seq, "原始还原温度不同"))
+                else:
+                    skipped.append(fr.seq)
+            if conflicts:
+                raise SupplementError(
+                    "补传与档案不一致，整份退回，档案保持原样。相关帧：%s。"
+                    % "；".join("帧 %d（%s）" % pair for pair in conflicts))
+
+            new_rows = [fr for fr in rows if fr.seq not in archive_initial]
+            conn.executemany(
+                "INSERT INTO frame (archive_id, seq, sampled_at, sampled_at_raw,"
+                " restored_mc, initial_restored_mc, base_seq, kind_raw, extras_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(archive_id, fr.seq, fr.sampled_at, fr.sampled_at_raw,
+                  decoded[fr.seq], decoded[fr.seq], fr.base_seq, fr.kind_raw,
+                  json.dumps(list(fr.extras), ensure_ascii=False))
+                 for fr in new_rows],
+            )
+            if new_rows:
+                conn.execute(
+                    "UPDATE archive SET source_filename = ? WHERE id = ?",
+                    (filename, archive_id))
+            conn.execute(
+                "INSERT INTO supplement (archive_id, source_filename, added_seqs,"
+                " skipped_seqs) VALUES (?, ?, ?, ?)",
+                (archive_id, filename,
+                 json.dumps([fr.seq for fr in new_rows]),
+                 json.dumps(sorted(skipped))),
+            )
+        return SupplementResult(added=tuple(fr.seq for fr in new_rows),
+                                skipped=tuple(sorted(skipped)))
+    finally:
+        conn.close()
+
+
+def _describe_layout(layout: csvio.CsvLayout) -> str:
+    text = layout.delimiter.join(layout.header)
+    if layout.delimiter != ",":
+        text += "（分隔符 %r）" % layout.delimiter
+    return repr(text)
 
 
 def export_csv(db_path: str, archive_id: int) -> bytes:

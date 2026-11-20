@@ -121,6 +121,18 @@ def archive_page(archive: ArchiveSummary, frames: list[FrameView],
     if missing_seq is not None:
         parts.append("<div class=\"notice bad\">本档案没有序号为 %d 的帧。</div>"
                      % missing_seq)
+    parts.append(
+        "<h2>补录记录仪补传</h2>"
+        "<form class=\"card\" method=\"post\" action=\"/archives/%d/supplement\""
+        " enctype=\"multipart/form-data\">"
+        "<label for=\"supplement\">补传 CSV 文件</label>"
+        "<input id=\"supplement\" name=\"file\" type=\"file\" accept=\".csv,text/csv\" required>"
+        "<p class=\"muted small\">表头与列序须与原档一致。差值帧可引用本文件或本档案中的较早帧；"
+        "解码用记录仪原值，档案里已更正的旧帧以其首次入档的还原温度为准。"
+        "同号帧的采样时刻与原始还原温度都相同则跳过（保留人工更正）；"
+        "缺基准或同号有出入时整份退回并报出相关帧号，档案保持原样。</p>"
+        "<button type=\"submit\">补录</button></form>" % archive.id
+    )
     parts.append("<p class=\"muted small\">点击帧序号进入单帧页面查看还原温度并提交更正。"
                  "绝对帧的存储值等于还原温度；相对帧的存储值是相对更早基准帧的差值。"
                  "更正基准帧不会改动其他帧的还原温度和基准引用。</p>")

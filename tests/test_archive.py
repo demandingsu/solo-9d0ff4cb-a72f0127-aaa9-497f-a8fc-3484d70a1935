@@ -10,6 +10,7 @@ import os
 import tempfile
 import unittest
 import unittest.mock
+import urllib.parse
 
 from lake_archive import archive as store
 from lake_archive import csvio
@@ -317,6 +318,229 @@ class TestPages(Base):
         page = self.client.get("/archives/%d" % aid).data.decode()
         self.assertNotIn("<script>alert(1)</script>", page)
         self.assertIn("&lt;script&gt;", page)
+
+
+class TestSupplement(Base):
+    """补录: re-transmitted frames merged into an existing archive."""
+
+    def supplement(self, payload, aid=None):
+        return self.client.post(
+            "/archives/%d/supplement" % (aid or self.aid),
+            data={"file": (io.BytesIO(payload), "retransmit.csv")},
+            content_type="multipart/form-data")
+
+    def test_new_frames_from_file_and_archive_bases(self):
+        # 6 cites archive frame 1; 7 cites 6 within this file;
+        # 8 cites archive frame 3 (which is absolute).
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n"
+                   b"7,2024-01-01T06:00:00Z,50,delta,6\n"
+                   b"8,2024-01-01T07:00:00Z,-200,delta,3\n")
+        r = self.supplement(payload)
+        self.assertEqual(r.status_code, 302)
+        f = self.frames()
+        self.assertEqual(f[6].restored_mc, -1400)   # -1500 + 100
+        self.assertEqual(f[7].restored_mc, -1350)   # -1400 + 50
+        self.assertEqual(f[8].restored_mc, 300)     # 500 + -200
+        self.assertEqual(f[6].base_seq, 1)
+        self.assertEqual(f[8].base_seq, 3)
+        # download carries the new frames too
+        rows, _ = csvio.parse_csv(self.download())
+        self.assertEqual([r.seq for r in rows], [1, 2, 3, 4, 5, 6, 7, 8])
+
+    def test_supplement_decodes_with_original_value_of_corrected_base(self):
+        # Correct frame 1 from -1500 to -2000, then reinstate frame 6 whose
+        # delta was measured against the recorder's -1500.
+        self.correct(1, seen=-1500, new=-2000)
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        r = self.supplement(payload)
+        self.assertEqual(r.status_code, 302)
+        # decoded with the recorder's original -1500, not the corrected -2000
+        self.assertEqual(self.frame(6).restored_mc, -1400)
+        self.assertEqual(self.frame(6).stored_mc, 600)   # -1400 - (-2000)
+        self.assertEqual(self.frame(1).restored_mc, -2000)  # correction kept
+
+    def test_duplicate_frame_matching_is_skipped_and_correction_kept(self):
+        self.correct(2, seen=-1250, new=-900)
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"2,2024-01-01T01:00:00Z,250,delta,1\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        r = self.supplement(payload)
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(self.frame(2).restored_mc, -900)   # manual correction kept
+        self.assertEqual(self.frame(6).restored_mc, -1400)  # new frame added
+        page = urllib.parse.unquote(r.headers["Location"])
+        self.assertIn("同号跳过帧：2", page)
+
+    def test_conflicting_same_seq_rejects_whole_file(self):
+        before = self.download()
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"2,2024-01-01T01:00:00Z,999,delta,1\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        r = self.supplement(payload)
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("帧 2", r.data.decode())
+        self.assertNotIn("帧 6", r.data.decode().split("相关帧")[-1])
+        self.assertEqual(self.download(), before)   # nothing written
+        self.assertNotIn(6, self.frames())
+
+    def test_conflicting_sampling_time_rejects(self):
+        before = self.download()
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"2,2024-01-01T09:00:00Z,250,delta,1\n")
+        r = self.supplement(payload)
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("帧 2", r.data.decode())
+        self.assertEqual(self.download(), before)
+
+    def test_missing_base_rejects_whole_file(self):
+        before = self.download()
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,0\n"
+                   b"7,2024-01-01T06:00:00Z,5,absolute,\n")
+        r = self.supplement(payload)
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("帧 6", r.data.decode())
+        self.assertIn("缺基准帧 0", r.data.decode())
+        self.assertEqual(self.download(), before)
+
+    def test_header_or_column_order_mismatch_rejected(self):
+        before = self.download()
+        for payload in (
+            b"seq,sampled_at_utc,value_millidegrees_c,base_seq,kind\n"
+            b"6,2024-01-01T05:00:00Z,100,1,delta\n",
+            b"seq,value_millidegrees_c,sampled_at_utc,kind,base_seq\n"
+            b"6,100,2024-01-01T05:00:00Z,delta,1\n",
+            b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq,site\n"
+            b"6,2024-01-01T05:00:00Z,100,delta,1,north\n",
+        ):
+            r = self.supplement(payload)
+            self.assertEqual(r.status_code, 400, payload)
+            self.assertIn("表头或列序", r.data.decode())
+            self.assertEqual(self.download(), before)
+
+    def test_alias_header_spelling_rejected_as_different_header(self):
+        # Equivalent meaning but different spelling is still a different header;
+        # the requirement is the same header as the original file.
+        payload = ("序号,采样时间,温度,kind,base_seq\n"
+                   "6,2024-01-01T05:00:00Z,100,delta,1\n").encode("utf-8")
+        r = self.supplement(payload)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("表头或列序", r.data.decode())
+
+    def test_supplement_file_order_does_not_matter(self):
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"7,2024-01-01T06:00:00Z,50,delta,6\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        self.assertEqual(self.supplement(payload).status_code, 302)
+        self.assertEqual(self.frame(7).restored_mc, -1350)
+
+    def test_two_supplements_apply_in_sequence(self):
+        first = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                 b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        second = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                  b"6,2024-01-01T05:00:00Z,100,delta,1\n"
+                  b"7,2024-01-01T06:00:00Z,50,delta,6\n")
+        self.assertEqual(self.supplement(first).status_code, 302)
+        self.assertEqual(self.supplement(second).status_code, 302)
+        f = self.frames()
+        self.assertEqual(f[6].restored_mc, -1400)   # not doubled
+        self.assertEqual(f[7].restored_mc, -1350)
+        self.assertEqual(len(f), 7)
+
+    def test_concurrent_supplements_only_add_once(self):
+        import threading
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def run():
+            barrier.wait()
+            try:
+                outcomes.append(store.supplement_archive(
+                    self.db, self.aid, "x.csv", payload))
+            except store.ArchiveError as exc:
+                outcomes.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(outcomes), 2)
+        added = sum(len(o.added) for o in outcomes
+                    if isinstance(o, store.SupplementResult))
+        skipped = sum(len(o.skipped) for o in outcomes
+                      if isinstance(o, store.SupplementResult))
+        self.assertEqual((added, skipped), (1, 1), outcomes)
+        self.assertEqual(self.frame(6).restored_mc, -1400)
+
+    def test_old_archive_can_be_supplemented_then_corrected(self):
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        self.assertEqual(self.supplement(payload).status_code, 302)
+        self.assertEqual(self.correct(6, seen=-1400, new=-1000).status_code, 302)
+        self.assertEqual(self.frame(6).restored_mc, -1000)
+        # a later re-transmission still matches the first-archived value
+        self.assertEqual(self.supplement(payload).status_code, 302)
+        self.assertEqual(self.frame(6).restored_mc, -1000)
+
+    def test_only_file_and_referenced_base_frames_are_read(self):
+        statements = []
+        real_connect = store.connect
+
+        def traced_connect(db_path):
+            conn = real_connect(db_path)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"6,2024-01-01T05:00:00Z,100,delta,1\n")
+        with unittest.mock.patch.object(store, "connect", traced_connect):
+            store.supplement_archive(self.db, self.aid, "x.csv", payload)
+        selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+        # No unqualified full-table scan of the archive's frames.
+        for s in selects:
+            if " FROM frame" in s:
+                self.assertIn("seq IN", s, s)
+        self.assertIn(6, self.frames())
+
+    def test_unknown_archive_404(self):
+        r = self.supplement(
+            b"seq,sampled_at_utc,value_millidegrees_c\n6,2024-01-01T05:00:00Z,1\n",
+            aid=999)
+        self.assertEqual(r.status_code, 404)
+
+
+class TestMigration(unittest.TestCase):
+    def test_old_database_gains_initial_restored(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "old.sqlite3")
+            conn = sqlite3.connect(db)
+            conn.executescript("""
+                CREATE TABLE archive (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                    source_filename TEXT NOT NULL, layout_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT 'x');
+                CREATE TABLE frame (archive_id INTEGER NOT NULL, seq INTEGER NOT NULL,
+                    sampled_at TEXT NOT NULL, sampled_at_raw TEXT NOT NULL,
+                    restored_mc INTEGER NOT NULL, base_seq INTEGER,
+                    kind_raw TEXT NOT NULL DEFAULT '', extras_json TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (archive_id, seq));
+                INSERT INTO frame VALUES (1, 1, '2024-01-01T00:00:00Z', 'x', -1500, NULL, '', '[]');
+            """)
+            conn.commit()
+            conn.close()
+            # migration runs without the schema's new column being present yet
+            conn = store.connect(db)
+            try:
+                store._migrate(conn)
+                row = conn.execute("SELECT initial_restored_mc FROM frame").fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row[0], -1500)
 
 
 if __name__ == "__main__":

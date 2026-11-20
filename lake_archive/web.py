@@ -52,14 +52,8 @@ def create_app(db_path: str | None = None) -> Flask:
 
     @app.get("/archives/<int:archive_id>")
     def show_archive(archive_id: int):
-        try:
-            summary = store.get_archive(db(), archive_id)
-            frames = store.list_frames(db(), archive_id)
-        except store.ArchiveError as exc:
-            abort(exc.status, exc.message)
-        return views.archive_page(summary, frames,
-                                  request.args.get("notice"),
-                                  request.args.get("kind", "ok"))
+        return archive_response(archive_id, request.args.get("notice"),
+                                request.args.get("kind", "ok"))
 
     def frame_response(archive_id: int, seq: int, notice=None, kind="ok", status=200):
         try:
@@ -113,6 +107,33 @@ def create_app(db_path: str | None = None) -> Flask:
             abort(exc.status, exc.message)
         return redirect(url_for("show_frame", archive_id=archive_id, seq=seq,
                                 notice="更正已提交。", kind="ok"))
+
+    @app.post("/archives/<int:archive_id>/supplement")
+    def supplement(archive_id: int):
+        upload_file = request.files.get("file")
+        if upload_file is None or not upload_file.filename:
+            return archive_response(archive_id, "请选择一个 CSV 文件。", "bad", 400)
+        try:
+            result = store.supplement_archive(
+                db(), archive_id, upload_file.filename, upload_file.read())
+        except CsvFormatError as exc:
+            return archive_response(archive_id, "CSV 无法补录：%s" % exc, "bad", 400)
+        except store.ArchiveError as exc:
+            return archive_response(archive_id, exc.message, "bad", exc.status)
+        added = "、".join(str(s) for s in result.added) or "无"
+        skipped = "、".join(str(s) for s in result.skipped) or "无"
+        return redirect(url_for(
+            "show_archive", archive_id=archive_id,
+            notice="补录完成，新入档帧：%s；同号跳过帧：%s。" % (added, skipped),
+            kind="ok"))
+
+    def archive_response(archive_id: int, notice=None, kind="ok", status=200):
+        try:
+            summary = store.get_archive(db(), archive_id)
+            frames = store.list_frames(db(), archive_id)
+        except store.ArchiveError as exc:
+            abort(exc.status, exc.message)
+        return views.archive_page(summary, frames, notice, kind), status
 
     @app.get("/archives/<int:archive_id>/download.csv")
     def download(archive_id: int):

@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS archive (
 --                    kept so the export reproduces the original CSV format
 --   restored_mc    : the archived (restored) temperature in integer
 --                    millidegrees Celsius -- authoritative
+--   initial_restored_mc : the restored temperature the frame had when it was
+--                    first archived, before any manual correction.  A
+--                    re-transmitted delta frame is decoded against the
+--                    recorder's original value of its base, so corrections
+--                    made in the archive never leak into a later decode.
 --   base_seq       : NULL when the frame is stored as an absolute value;
 --                    otherwise the seq of the earlier frame it is relative to
 --   kind_raw       : the kind token exactly as the source file spelled it,
@@ -35,6 +40,7 @@ CREATE TABLE IF NOT EXISTS frame (
     sampled_at     TEXT    NOT NULL,
     sampled_at_raw TEXT    NOT NULL,
     restored_mc    INTEGER NOT NULL,
+    initial_restored_mc INTEGER NOT NULL,
     base_seq       INTEGER,
     kind_raw       TEXT    NOT NULL DEFAULT '',
     extras_json    TEXT    NOT NULL DEFAULT '[]',
@@ -66,3 +72,16 @@ CREATE TABLE IF NOT EXISTS revision (
 );
 
 CREATE INDEX IF NOT EXISTS revision_by_frame ON revision (archive_id, seq, id);
+
+-- One row per accepted supplement upload: which recorder file was merged, and
+-- which frame numbers were newly archived or skipped as already present.
+CREATE TABLE IF NOT EXISTS supplement (
+    id              INTEGER PRIMARY KEY,
+    archive_id      INTEGER NOT NULL REFERENCES archive(id) ON DELETE CASCADE,
+    source_filename TEXT    NOT NULL,
+    added_seqs      TEXT    NOT NULL,
+    skipped_seqs    TEXT    NOT NULL,
+    submitted_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS supplement_by_archive ON supplement (archive_id, id);

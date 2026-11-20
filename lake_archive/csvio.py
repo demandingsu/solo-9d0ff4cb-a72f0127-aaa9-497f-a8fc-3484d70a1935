@@ -143,8 +143,14 @@ def _parse_int(raw: str, what: str, line: int) -> int:
     return int(text, 10)
 
 
-def parse_csv(data: bytes) -> tuple[list[FrameRow], CsvLayout]:
-    """Parse a logger CSV into validated frames ordered by seq, plus its layout."""
+def parse_csv(data: bytes, *, require_bases_in_file: bool = True
+              ) -> tuple[list[FrameRow], CsvLayout]:
+    """Parse a logger CSV into validated frames ordered by seq, plus its layout.
+
+    ``require_bases_in_file`` is False for a supplement upload, where a delta
+    frame may reference an earlier frame that is already in the archive rather
+    than in the uploaded file.  The caller resolves such bases.
+    """
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -237,10 +243,11 @@ def parse_csv(data: bytes) -> tuple[list[FrameRow], CsvLayout]:
 
     if not rows:
         raise CsvFormatError("file contains no frames")
-    for fr in rows:
-        if fr.stored_kind == "delta" and fr.base_seq not in seen:
-            raise CsvFormatError(
-                "frame %d references missing base frame %d" % (fr.seq, fr.base_seq))
+    if require_bases_in_file:
+        for fr in rows:
+            if fr.stored_kind == "delta" and fr.base_seq not in seen:
+                raise CsvFormatError(
+                    "frame %d references missing base frame %d" % (fr.seq, fr.base_seq))
     rows.sort(key=lambda f: f.seq)
 
     layout = CsvLayout(
